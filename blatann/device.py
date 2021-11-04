@@ -1,6 +1,8 @@
 import logging
 from threading import Lock
 from typing import Union
+import libusb 
+import time
 
 from blatann import peer, exceptions
 from blatann.gap import advertising, scanning, default_bond_db, IoCapabilities, SecurityParameters, PairingPolicy
@@ -90,7 +92,7 @@ class _UuidManager(object):
 class BleDevice(NrfDriverObserver):
     """
     Represents the Bluetooth device itself. Provides the high-level bluetooth APIs (Advertising, Scanning, Connections),
-    configuration, and bond database.
+    configuration, and bond database. Note that all parameters are saved to reinitialize if connection to nrf52 dongle fails.
 
     :param comport: The port the nRF52 device lives on, e.g. ``"COM3"``, ``"/dev/ttyS0"``
     :param baud: The baud rate to use. By default the connectivity firmware images for v0.3+ use 1M baud.
@@ -111,6 +113,12 @@ class BleDevice(NrfDriverObserver):
     def __init__(self, comport="COM1", baud=1000000, log_driver_comms=False,
                  notification_hw_queue_size=16, write_command_hw_queue_size=16,
                  bond_db_filename="user"):
+        self._comport = comport
+        self._baud = baud
+        self._log_driver_comms = log_driver_comms
+        self._notification_hw_queue_size = notification_hw_queue_size
+        self._write_command_hw_queue_size = write_command_hw_queue_size
+        self._bond_db_filename = bond_db_filename
         self.ble_driver = NrfDriver(comport, baud, log_driver_comms)
         self.event_logger = _EventLogger(self.ble_driver)
         self.ble_driver.observer_register(self)
@@ -172,21 +180,46 @@ class BleDevice(NrfDriverObserver):
                                                             service_changed, attribute_table_size)
         self._default_conn_config.max_att_mtu = att_mtu_max_size
 
+
+    def wait_for_nrf52_to_restart(self):
+        """
+        Scans for the VID and PID of nrf52840 dongle and returns when it appears. Timeout is fixed to 2 sec
+        """
+        device_VID = 0x1915
+        device_PID = 0xC00A
+        for _ in range(20):
+            try:
+                xdev = libusb.core.find(idVendor=device_VID, idProduct=device_PID)
+                if xdev._manufacturer is not None:
+                    return
+            except:
+                time.sleep(0.1)
+        
     def open(self, clear_bonding_data=False):
         """
         Opens the connection to the BLE device. Must be called prior to performing any BLE operations
 
         :param clear_bonding_data: Flag that the bonding data should be cleared prior to opening the device.
         """
-        if clear_bonding_data:
-            self.clear_bonding_data()
-        else:
-            self.bond_db = self.bond_db_loader.load()
-        self.ble_driver.open()
-        self._default_conn_config.conn_count = self._ble_configuration.central_role_count + self._ble_configuration.periph_role_count
-        self.ble_driver.ble_conn_configure(self._default_conn_config)
-        self.ble_driver.ble_enable(self._ble_configuration)
-        self._generic_access_service.update()
+        try_max = 3
+        for try_counter in range(try_max+1):
+            try:
+                if clear_bonding_data:
+                    self.clear_bonding_data()
+                else:
+                    self.bond_db = self.bond_db_loader.load()
+                self.ble_driver.open()
+                self._default_conn_config.conn_count = self._ble_configuration.central_role_count + self._ble_configuration.periph_role_count
+                self.ble_driver.ble_conn_configure(self._default_conn_config)
+                self.ble_driver.ble_enable(self._ble_configuration)
+                self._generic_access_service.update()
+                return
+            except:
+                if try_counter == try_max:
+                    raise exceptions.BlatannException("Repeated connection to NRF52 fails with NrfError.rpc_h5_transport_state #75")
+                else:
+                    self.__init__(self._comport, self._baud, self._log_driver_comms, self._notification_hw_queue_size, self._write_command_hw_queue_size, self._bond_db_filename)
+                    self.wait_for_nrf52_to_restart()
 
     def close(self):
         """

@@ -1,3 +1,4 @@
 pc-ble-driver-py>=0.13
 cryptography
 pytz
+libusb
